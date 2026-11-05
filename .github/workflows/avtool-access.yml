@@ -3,20 +3,31 @@ name: AVTool Access Control
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '17 4 * * *'
 
 permissions:
   contents: read
 
+concurrency:
+  group: avtool-access-publisher
+  cancel-in-progress: false
+
 jobs:
-  generate-and-verify:
-    name: Generate and Verify Signed Access Token
+  publish-access-token:
+    name: Sign Verify and Publish
     runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: true
 
-      - name: Verify access switch
+      - name: Validate access switch
         env:
           AVTOOL_ACCESS_ENABLED: ${{ vars.AVTOOL_ACCESS_ENABLED }}
         shell: bash
@@ -25,6 +36,7 @@ jobs:
             echo "ERROR: Invalid access switch"
             exit 1
           fi
+
           echo "ACCESS SWITCH VERIFIED"
 
       - name: Verify ECDSA key pair
@@ -38,29 +50,37 @@ jobs:
           AVTOOL_ACCESS_ENABLED: ${{ vars.AVTOOL_ACCESS_ENABLED }}
         run: python3 tools/generate-access-token.py
 
-      - name: Verify signed access token
+      - name: Verify signed token
+        env:
+          EXPECTED_ACCESS: ${{ vars.AVTOOL_ACCESS_ENABLED }}
         shell: bash
         run: |
           python3 - <<'PY'
           import base64
           import json
+          import os
           import subprocess
           import tempfile
-          from datetime import datetime, timedelta, timezone
           from pathlib import Path
+          from datetime import datetime, timedelta, timezone
 
-          token_path = Path("access-token.json")
-          if not token_path.is_file():
-              raise RuntimeError("Token file missing")
+          token = json.loads(
+              Path("access-token.json").read_text(encoding="utf-8")
+          )
 
-          token = json.loads(token_path.read_text(encoding="utf-8"))
-          payload = base64.b64decode(token["payload"], validate=True)
-          signature = base64.b64decode(token["signature"], validate=True)
+          payload = base64.b64decode(
+              token["payload"], validate=True
+          )
+
+          signature = base64.b64decode(
+              token["signature"], validate=True
+          )
 
           with tempfile.TemporaryDirectory() as directory:
-              payload_path = Path(directory) / "payload.bin"
+              message_path = Path(directory) / "payload.bin"
               signature_path = Path(directory) / "signature.bin"
-              payload_path.write_bytes(payload)
+
+              message_path.write_bytes(payload)
               signature_path.write_bytes(signature)
 
               result = subprocess.run(
@@ -68,14 +88,14 @@ jobs:
                       "openssl", "dgst", "-sha256",
                       "-verify", "avtool-signing-public.pem",
                       "-signature", str(signature_path),
-                      str(payload_path)
+                      str(message_path)
                   ],
                   capture_output=True,
                   text=True
               )
 
               if result.returncode != 0:
-                  raise RuntimeError("Invalid token signature")
+                  raise RuntimeError("Invalid digital signature")
 
           data = json.loads(payload)
 
@@ -85,38 +105,54 @@ jobs:
           if data["product"] != "AVTool":
               raise RuntimeError("Invalid product")
 
-          if not isinstance(data["enabled"], bool):
-              raise RuntimeError("Invalid access value")
+          if type(data["enabled"]) is not bool:
+              raise RuntimeError("Invalid enabled type")
+
+          expected = os.environ["EXPECTED_ACCESS"] == "true"
+
+          if data["enabled"] != expected:
+              raise RuntimeError("Access switch mismatch")
 
           issued = datetime.fromisoformat(
               data["issuedAtUtc"].replace("Z", "+00:00")
           )
+
           expires = datetime.fromisoformat(
               data["expiresAtUtc"].replace("Z", "+00:00")
           )
 
           now = datetime.now(timezone.utc)
 
-          if expires <= issued:
-              raise RuntimeError("Invalid expiration time")
-
           if expires - issued != timedelta(hours=168):
               raise RuntimeError("Invalid validity period")
 
           if issued > now + timedelta(minutes=5):
-              raise RuntimeError("Token issued in the future")
+              raise RuntimeError("Future issue timestamp")
 
           if expires <= now:
-              raise RuntimeError("Token expired")
+              raise RuntimeError("Expired token")
 
           print("TOKEN SIGNATURE VERIFIED")
-          print("PRODUCT VERIFIED: AVTool")
-          print("ACCESS VALUE:", data["enabled"])
+          print("ACCESS VALUE VERIFIED:", expected)
           print("VALIDITY VERIFIED: 168 HOURS")
-          print("SIGNED TOKEN TEST PASSED")
+          print("TOKEN READY FOR PUBLICATION")
           PY
 
-      - name: Summary
+      - name: Publish signed token
+        shell: bash
         run: |
-          echo "AVTool token generation and verification completed"
-          echo "No token was published"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- access-token.json
+
+          if git diff --cached --quiet; then
+            echo "Token unchanged"
+            exit 0
+          fi
+
+          git commit -m "AVTool: refresh signed access token"
+
+          git push origin HEAD:main
+
+          echo "SIGNED ACCESS TOKEN PUBLISHED"
