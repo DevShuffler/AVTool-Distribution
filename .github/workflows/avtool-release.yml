@@ -3,35 +3,287 @@ name: AVTool Release Signing
 
 on:
   workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: "Successful AVTool Build run ID"
+        required: true
+        default: "42038003416"
+        type: string
+      version:
+        description: "AVTool version"
+        required: true
+        default: "1.0.1"
+        type: string
 
 permissions:
   contents: read
 
 jobs:
-  verify-signing:
-    name: Verify release signing environment
+  sign-release:
+    name: Download Verify and Sign Release
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
+
+    env:
+      AVTOOL_VERSION: ${{ inputs.version }}
+      AVTOOL_BUILD_RUN_ID: ${{ inputs.build_run_id }}
 
     steps:
       - name: Checkout distribution repository
         uses: actions/checkout@v4
 
-      - name: Verify Python syntax
+      - name: Validate input and Python syntax
         run: |
+          set -euo pipefail
+          [[ "$AVTOOL_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$AVTOOL_BUILD_RUN_ID" =~ ^[0-9]+$ ]]
           python3 -m py_compile tools/sign-release.py
           python3 -m py_compile tools/sign-test.py
-          echo "PYTHON SYNTAX VERIFIED"
+          test -f avtool-signing-public.pem
+          echo "INPUT AND PYTHON VERIFIED"
 
-      - name: Verify signing key pair
+      - name: Download and verify AVTool build
+        env:
+          AVTOOL_BUILD_ARTIFACT_TOKEN: ${{ secrets.AVTOOL_BUILD_ARTIFACT_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import urllib.request
+          import zipfile
+          from pathlib import Path
+
+          token = os.environ["AVTOOL_BUILD_ARTIFACT_TOKEN"]
+          run_id = os.environ["AVTOOL_BUILD_RUN_ID"]
+          version = os.environ["AVTOOL_VERSION"]
+
+          if not token:
+              raise RuntimeError("Artifact token missing")
+
+          base = "https://api.github.com"
+          repository = "DevShuffler/AVTool"
+          artifact_name = f"AVTool-Distribution-{version}"
+          package_name = f"AVTool-{version}.zip"
+          checksum_name = package_name + ".sha256"
+
+          def api_get(url):
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "AVTool-Release-Signing",
+                  },
+              )
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return response.read()
+
+          run = json.loads(api_get(
+              f"{base}/repos/{repository}/actions/runs/{run_id}"
+          ))
+
+          if run["repository"]["full_name"] != repository:
+              raise RuntimeError("Unexpected source repository")
+
+          if run["conclusion"] != "success":
+              raise RuntimeError("Source build was not successful")
+
+          if run["event"] != "workflow_dispatch":
+              raise RuntimeError("Unexpected build event")
+
+          if run["head_branch"] != "recovery/unified-schedule-20261030":
+              raise RuntimeError("Unexpected source branch")
+
+          workflow_path = run.get("path", "").split("@")[0]
+          if workflow_path != ".github/workflows/build-avtool.yml":
+              raise RuntimeError("Unexpected source workflow")
+
+          artifacts = json.loads(api_get(
+              f"{base}/repos/{repository}/actions/runs/{run_id}/artifacts"
+              "?per_page=100"
+          ))["artifacts"]
+
+          matches = [
+              item for item in artifacts
+              if item["name"] == artifact_name
+              and not item["expired"]
+          ]
+
+          if len(matches) != 1:
+              raise RuntimeError(
+                  "Expected exactly one valid build artifact"
+              )
+
+          archive = api_get(matches[0]["archive_download_url"])
+
+          expected_files = {
+              package_name,
+              checksum_name,
+              "AVTool.Setup.exe",
+          }
+
+          output = Path("dist")
+          output.mkdir(exist_ok=True)
+
+          with zipfile.ZipFile(io.BytesIO(archive)) as z:
+              names = set(z.namelist())
+
+              if names != expected_files:
+                  raise RuntimeError(
+                      f"Unexpected artifact contents: {sorted(names)}"
+                  )
+
+              for name in sorted(expected_files):
+                  item = z.getinfo(name)
+                  if item.is_dir() or item.file_size > 100_000_000:
+                      raise RuntimeError("Invalid artifact entry")
+
+                  data = z.read(name)
+                  if not data:
+                      raise RuntimeError(f"Empty file: {name}")
+
+                  (output / name).write_bytes(data)
+
+          package = output / package_name
+          actual_hash = hashlib.sha256(
+              package.read_bytes()
+          ).hexdigest().upper()
+
+          checksum = (
+              output / checksum_name
+          ).read_text(encoding="ascii").strip()
+
+          expected_checksum = f"{actual_hash}  {package_name}"
+
+          if checksum.upper() != expected_checksum.upper():
+              raise RuntimeError("SHA256 checksum mismatch")
+
+          with zipfile.ZipFile(package) as z:
+              required = {
+                  "AVTool.Core.dll",
+                  "AVTool.Contracts.dll",
+                  "AVTool.Core.deps.json",
+                  "System.Security.Cryptography.ProtectedData.dll",
+                  "Modules/VK/AVTool.Modules.VK.dll",
+              }
+
+              if not required.issubset(set(z.namelist())):
+                  raise RuntimeError("Missing required AVTool DLL")
+
+          print("SOURCE RUN VERIFIED:", run_id)
+          print("SOURCE COMMIT:", run["head_sha"])
+          print("VERSION:", version)
+          print("SHA256:", actual_hash)
+          print("BUILD ARTIFACT VERIFIED")
+          PY
+
+      - name: Verify ECDSA signing key
         env:
           AVTOOL_SIGNING_PRIVATE_KEY: ${{ secrets.AVTOOL_SIGNING_PRIVATE_KEY }}
         run: |
+          set -euo pipefail
           python3 tools/sign-test.py
-          echo "SIGNING KEY VERIFIED"
 
-      - name: Verify release signing script without publishing
+      - name: Sign AVTool release
+        env:
+          AVTOOL_SIGNING_PRIVATE_KEY: ${{ secrets.AVTOOL_SIGNING_PRIVATE_KEY }}
         run: |
-          test -f tools/sign-release.py
-          test -f avtool-signing-public.pem
-          echo "RELEASE SIGNING ENVIRONMENT READY"
+          set -euo pipefail
+          python3 tools/sign-release.py
+          echo "RELEASE MANIFEST CREATED"
+
+      - name: Verify signed release manifest
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          version = os.environ["AVTOOL_VERSION"]
+          name = f"AVTool-{version}.zip"
+          package = Path("dist") / name
+          manifest_path = Path("dist") / (name + ".release.json")
+
+          manifest = json.loads(
+              manifest_path.read_text(encoding="utf-8")
+          )
+
+          if set(manifest) != {"payload", "signature"}:
+              raise RuntimeError("Unexpected manifest structure")
+
+          payload_bytes = base64.b64decode(
+              manifest["payload"], validate=True
+          )
+          signature = base64.b64decode(
+              manifest["signature"], validate=True
+          )
+
+          with tempfile.TemporaryDirectory() as directory:
+              folder = Path(directory)
+              payload_file = folder / "payload.bin"
+              signature_file = folder / "signature.der"
+
+              payload_file.write_bytes(payload_bytes)
+              signature_file.write_bytes(signature)
+
+              subprocess.run(
+                  [
+                      "openssl", "dgst", "-sha256",
+                      "-verify", "avtool-signing-public.pem",
+                      "-signature", str(signature_file),
+                      str(payload_file),
+                  ],
+                  check=True,
+              )
+
+          payload = json.loads(payload_bytes)
+
+          if payload["schemaVersion"] != 1:
+              raise RuntimeError("Invalid schema")
+
+          if payload["product"] != "AVTool":
+              raise RuntimeError("Invalid product")
+
+          if payload["version"] != version:
+              raise RuntimeError("Version mismatch")
+
+          if payload["packageFile"] != name:
+              raise RuntimeError("Package name mismatch")
+
+          actual_hash = hashlib.sha256(
+              package.read_bytes()
+          ).hexdigest()
+
+          if payload["sha256"].lower() != actual_hash:
+              raise RuntimeError("Signed SHA256 mismatch")
+
+          print("ECDSA RELEASE SIGNATURE VERIFIED")
+          print("SIGNED PACKAGE SHA256 VERIFIED")
+          PY
+
+      - name: Verify final release files
+        run: |
+          set -euo pipefail
+          test -s "dist/AVTool-${AVTOOL_VERSION}.zip"
+          test -s "dist/AVTool-${AVTOOL_VERSION}.zip.sha256"
+          test -s "dist/AVTool-${AVTOOL_VERSION}.zip.release.json"
+          test -s "dist/AVTool.Setup.exe"
+          echo "SIGNED RELEASE PACKAGE READY"
+
+      - name: Upload signed release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AVTool-Signed-${{ inputs.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
