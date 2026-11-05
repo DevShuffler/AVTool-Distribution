@@ -30,17 +30,10 @@ jobs:
           fi
           echo "Access configuration valid"
 
-      - name: Verify signing secret exists
+      - name: Verify ECDSA signing keys
         env:
           AVTOOL_SIGNING_PRIVATE_KEY: ${{ secrets.AVTOOL_SIGNING_PRIVATE_KEY }}
-        run: |
-          if [ -z "$AVTOOL_SIGNING_PRIVATE_KEY" ]; then
-            echo "Signing secret is missing"
-            exit 1
-          fi
-          echo "Signing secret is configured"
+        run: python3 tools/sign-test.py
 
-      - name: Check environment
-        run: |
-          dotnet --version
-          echo "AVTool signing environment ready"
+      - name: Verify .NET environment
+        run: dotnet --version
