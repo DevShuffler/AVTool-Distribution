@@ -160,10 +160,6 @@ jobs:
                   headers=headers
               )
 
-              # Request the artifact from GitHub API,
-              # but do not automatically follow redirects
-              # with the authentication token.
-
               try:
                   api_opener.open(
                       request,
@@ -171,7 +167,9 @@ jobs:
                   )
 
               except urllib.error.HTTPError as error:
-                  if error.code not in (301, 302, 303, 307, 308):
+                  if error.code not in (
+                      301, 302, 303, 307, 308
+                  ):
                       host = urllib.parse.urlsplit(
                           error.url
                       ).hostname
@@ -219,9 +217,6 @@ jobs:
                   "ARTIFACT STORAGE HOST:",
                   parsed.hostname
               )
-
-              # The storage URL is signed separately
-              # by GitHub and does not need the PAT.
 
               storage_request = urllib.request.Request(
                   redirect_url,
@@ -316,7 +311,7 @@ jobs:
               run.get("head_sha")
           )
 
-          # 2. Find exactly one matching artifact.
+          # 2. Find matching artifact.
 
           artifacts_url = (
               f"{api_base}/repos/{repository}"
@@ -366,7 +361,7 @@ jobs:
               "bytes"
           )
 
-          # 4. Validate archive contents.
+          # 4. Validate outer artifact archive.
 
           expected_files = {
               package_name,
@@ -453,7 +448,8 @@ jobs:
           print("PACKAGE SHA256 VERIFIED")
           print("SHA256:", package_hash)
 
-          # 6. Verify the inner AVTool ZIP.
+          # 6. Verify inner AVTool ZIP.
+          # Normalize Windows and Unix separators.
 
           required_dlls = {
               "AVTool.Core.dll",
@@ -467,9 +463,31 @@ jobs:
               package_path
           ) as package_zip:
 
-              actual_files = set(
-                  package_zip.namelist()
-              )
+              actual_files = set()
+
+              for entry in package_zip.infolist():
+                  normalized_name = (
+                      entry.filename.replace("\\", "/")
+                  )
+
+                  if normalized_name.startswith("/"):
+                      raise RuntimeError(
+                          "Invalid absolute ZIP path"
+                      )
+
+                  components = normalized_name.split("/")
+
+                  if ".." in components:
+                      raise RuntimeError(
+                          "Invalid ZIP path traversal"
+                      )
+
+                  if normalized_name in actual_files:
+                      raise RuntimeError(
+                          "Duplicate ZIP entry"
+                      )
+
+                  actual_files.add(normalized_name)
 
               missing = required_dlls - actual_files
 
@@ -477,6 +495,8 @@ jobs:
                   raise RuntimeError(
                       "Missing AVTool files: "
                       + repr(sorted(missing))
+                      + "; actual files: "
+                      + repr(sorted(actual_files))
                   )
 
           print("AVTOOL PACKAGE VERIFIED")
@@ -489,7 +509,9 @@ jobs:
           AVTOOL_SIGNING_PRIVATE_KEY: ${{ secrets.AVTOOL_SIGNING_PRIVATE_KEY }}
         run: |
           set -euo pipefail
+
           python3 tools/sign-test.py
+
           echo "ECDSA SIGNING KEY VERIFIED"
 
       - name: Sign AVTool release
@@ -498,7 +520,9 @@ jobs:
           AVTOOL_SIGNING_PRIVATE_KEY: ${{ secrets.AVTOOL_SIGNING_PRIVATE_KEY }}
         run: |
           set -euo pipefail
+
           python3 tools/sign-release.py
+
           echo "RELEASE MANIFEST CREATED"
 
       - name: Verify signed release manifest
@@ -552,7 +576,7 @@ jobs:
               validate=True
           )
 
-          # Verify ECDSA P-256 / SHA256 / DER.
+          # Verify ECDSA SHA256 DER signature.
 
           with tempfile.TemporaryDirectory() as directory:
               temp = Path(directory)
