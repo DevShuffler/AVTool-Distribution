@@ -1,0 +1,30 @@
+name: AVTool Access Control
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-environment:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout distribution repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Verify .NET environment
+        run: dotnet --version
+
+      - name: Verify access configuration
+        shell: bash
+        run: |
+          test -f access.json
+          python3 -c "import json; c=json.load(open('access.json')); assert c['product']=='AVTool'; assert c['offlineGracePeriodHours']==168"
+          echo "AVTool access configuration verified"
