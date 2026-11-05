@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "product": "AVTool",
+  "enabled": true,
+  "checkIntervalHours": 24,
+  "offlineGracePeriodHours": 168,
+  "minimumVersion": "1.0.0",
+  "message": "AVTool access is enabled"
+}
