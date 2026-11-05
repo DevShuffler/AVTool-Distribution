@@ -8,34 +8,115 @@ permissions:
   contents: read
 
 jobs:
-  sign-access-token:
-    name: Verify AVTool ECDSA Signing
+  generate-and-verify:
+    name: Generate and Verify Signed Access Token
     runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify access variable
+      - name: Verify access switch
         env:
           AVTOOL_ACCESS_ENABLED: ${{ vars.AVTOOL_ACCESS_ENABLED }}
         shell: bash
         run: |
-          if [ "$AVTOOL_ACCESS_ENABLED" != "true" ] && [ "$AVTOOL_ACCESS_ENABLED" != "false" ]; then
-            echo "Invalid access variable"
+          if [[ "$AVTOOL_ACCESS_ENABLED" != "true" && "$AVTOOL_ACCESS_ENABLED" != "false" ]]; then
+            echo "ERROR: Invalid access switch"
             exit 1
           fi
-          echo "ACCESS VARIABLE VERIFIED"
+          echo "ACCESS SWITCH VERIFIED"
 
-      - name: Verify ECDSA signing keys
+      - name: Verify ECDSA key pair
         env:
           AVTOOL_SIGNING_PRIVATE_KEY: ${{ secrets.AVTOOL_SIGNING_PRIVATE_KEY }}
-        shell: bash
-        run: |
-          python3 tools/sign-test.py
+        run: python3 tools/sign-test.py
 
-      - name: Verification summary
+      - name: Generate signed access token
+        env:
+          AVTOOL_SIGNING_PRIVATE_KEY: ${{ secrets.AVTOOL_SIGNING_PRIVATE_KEY }}
+          AVTOOL_ACCESS_ENABLED: ${{ vars.AVTOOL_ACCESS_ENABLED }}
+        run: python3 tools/generate-access-token.py
+
+      - name: Verify signed access token
         shell: bash
         run: |
-          echo "AVTool ECDSA signing verification completed"
-          echo "No access token was published"
+          python3 - <<'PY'
+          import base64
+          import json
+          import subprocess
+          import tempfile
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+
+          token_path = Path("access-token.json")
+          if not token_path.is_file():
+              raise RuntimeError("Token file missing")
+
+          token = json.loads(token_path.read_text(encoding="utf-8"))
+          payload = base64.b64decode(token["payload"], validate=True)
+          signature = base64.b64decode(token["signature"], validate=True)
+
+          with tempfile.TemporaryDirectory() as directory:
+              payload_path = Path(directory) / "payload.bin"
+              signature_path = Path(directory) / "signature.bin"
+              payload_path.write_bytes(payload)
+              signature_path.write_bytes(signature)
+
+              result = subprocess.run(
+                  [
+                      "openssl", "dgst", "-sha256",
+                      "-verify", "avtool-signing-public.pem",
+                      "-signature", str(signature_path),
+                      str(payload_path)
+                  ],
+                  capture_output=True,
+                  text=True
+              )
+
+              if result.returncode != 0:
+                  raise RuntimeError("Invalid token signature")
+
+          data = json.loads(payload)
+
+          if data["schemaVersion"] != 1:
+              raise RuntimeError("Invalid schema version")
+
+          if data["product"] != "AVTool":
+              raise RuntimeError("Invalid product")
+
+          if not isinstance(data["enabled"], bool):
+              raise RuntimeError("Invalid access value")
+
+          issued = datetime.fromisoformat(
+              data["issuedAtUtc"].replace("Z", "+00:00")
+          )
+          expires = datetime.fromisoformat(
+              data["expiresAtUtc"].replace("Z", "+00:00")
+          )
+
+          now = datetime.now(timezone.utc)
+
+          if expires <= issued:
+              raise RuntimeError("Invalid expiration time")
+
+          if expires - issued != timedelta(hours=168):
+              raise RuntimeError("Invalid validity period")
+
+          if issued > now + timedelta(minutes=5):
+              raise RuntimeError("Token issued in the future")
+
+          if expires <= now:
+              raise RuntimeError("Token expired")
+
+          print("TOKEN SIGNATURE VERIFIED")
+          print("PRODUCT VERIFIED: AVTool")
+          print("ACCESS VALUE:", data["enabled"])
+          print("VALIDITY VERIFIED: 168 HOURS")
+          print("SIGNED TOKEN TEST PASSED")
+          PY
+
+      - name: Summary
+        run: |
+          echo "AVTool token generation and verification completed"
+          echo "No token was published"
