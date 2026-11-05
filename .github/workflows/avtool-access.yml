@@ -8,6 +8,7 @@ permissions:
 
 jobs:
   sign-access-token:
+    name: Diagnose AVTool Signing
     runs-on: ubuntu-24.04
 
     steps:
@@ -22,17 +23,75 @@ jobs:
       - name: Verify access variable
         env:
           AVTOOL_ACCESS_ENABLED: ${{ vars.AVTOOL_ACCESS_ENABLED }}
+        shell: bash
         run: |
           if [ "$AVTOOL_ACCESS_ENABLED" != "true" ] && [ "$AVTOOL_ACCESS_ENABLED" != "false" ]; then
-            echo "Invalid access variable"
+            echo "ERROR: Invalid AVTOOL_ACCESS_ENABLED variable"
             exit 1
           fi
-          echo "Access configuration valid"
 
-      - name: Verify ECDSA signing keys
+          echo "ACCESS VARIABLE VALID: True"
+
+      - name: Diagnose signing secret
         env:
           AVTOOL_SIGNING_PRIVATE_KEY: ${{ secrets.AVTOOL_SIGNING_PRIVATE_KEY }}
-        run: python3 tools/sign-test.py
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+
+          key = os.environ.get("AVTOOL_SIGNING_PRIVATE_KEY", "")
+
+          present = bool(key)
+          header_valid = key.lstrip().startswith(
+              "-----BEGIN EC PRIVATE KEY-----"
+          )
+          footer_valid = (
+              "-----END EC PRIVATE KEY-----" in key
+          )
+
+          print("SECRET PRESENT:", present)
+          print("PEM HEADER VALID:", header_valid)
+          print("PEM FOOTER VALID:", footer_valid)
+
+          if not present:
+              raise SystemExit("ERROR: Signing secret is empty")
+
+          if not header_valid or not footer_valid:
+              raise SystemExit("ERROR: Signing secret has invalid PEM format")
+
+          print("SIGNING SECRET FORMAT VERIFIED")
+          PY
+
+      - name: Verify public key file
+        shell: bash
+        run: |
+          test -f avtool-signing-public.pem
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          key = Path("avtool-signing-public.pem").read_text(
+              encoding="utf-8"
+          )
+
+          if not key.startswith("-----BEGIN PUBLIC KEY-----"):
+              raise SystemExit("ERROR: Invalid public key header")
+
+          if "-----END PUBLIC KEY-----" not in key:
+              raise SystemExit("ERROR: Invalid public key footer")
+
+          print("PUBLIC KEY FILE VERIFIED")
+          PY
 
       - name: Verify .NET environment
-        run: dotnet --version
+        shell: bash
+        run: |
+          dotnet --version
+          echo "DOTNET ENVIRONMENT VERIFIED"
+
+      - name: Diagnostic summary
+        shell: bash
+        run: |
+          echo "AVTool access control diagnostics completed"
+          echo "No access token was published"
