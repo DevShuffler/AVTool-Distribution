@@ -1,0 +1,37 @@
+
+name: AVTool Release Signing
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-signing:
+    name: Verify release signing environment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout distribution repository
+        uses: actions/checkout@v4
+
+      - name: Verify Python syntax
+        run: |
+          python3 -m py_compile tools/sign-release.py
+          python3 -m py_compile tools/sign-test.py
+          echo "PYTHON SYNTAX VERIFIED"
+
+      - name: Verify signing key pair
+        env:
+          AVTOOL_SIGNING_PRIVATE_KEY: ${{ secrets.AVTOOL_SIGNING_PRIVATE_KEY }}
+        run: |
+          python3 tools/sign-test.py
+          echo "SIGNING KEY VERIFIED"
+
+      - name: Verify release signing script without publishing
+        run: |
+          test -f tools/sign-release.py
+          test -f avtool-signing-public.pem
+          echo "RELEASE SIGNING ENVIRONMENT READY"
